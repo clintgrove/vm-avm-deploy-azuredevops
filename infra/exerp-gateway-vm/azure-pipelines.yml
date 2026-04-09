@@ -1,0 +1,210 @@
+# =============================================================================
+# Exerp Data Gateway VM — Azure DevOps Pipeline
+# =============================================================================
+# Triggers:
+#   - PR to main           → bicep build + what-if (validate only, no deploy)
+#   - Merge/push to main   → bicep build + what-if + deploy to prod
+#
+# Prerequisites in Azure DevOps:
+#   1. Service Connection named 'sc-azure-puregym-prod' (Azure Resource Manager,
+#      Workload Identity Federation recommended — no client secret rotation needed)
+#      Scope: Subscription level (required because targetScope = 'subscription')
+#
+#   2. Variable Group named 'exerp-gateway-secrets' containing:
+#        VM_ADMIN_PASSWORD        — VM local admin password (secret)
+#        ENTRA_VM_ADMIN_GROUP_OID — Object ID of the Entra group for VM Login
+#
+#   3. The service principal behind the service connection needs:
+#        - Contributor on the subscription (to create resource group + resources)
+#        - User Access Administrator on the subscription (to create role assignments)
+#        OR a custom role combining both, scoped tightly to the resource group
+#
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infra/exerp-gateway-vm/**
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - infra/exerp-gateway-vm/**
+
+# ---------------------------------------------------------------------------
+# Variables
+# ---------------------------------------------------------------------------
+variables:
+  # Azure service connection — must be subscription-scoped for sub-level deployment
+  azureServiceConnection: 'sc-azure-puregym-as1'
+  subscriptionId: '$(AZURE_SUBSCRIPTION_ID)'  # Set in pipeline UI or variable group
+
+  # Deployment location and template paths
+  deploymentLocation: 'uksouth'
+  templateFile:   '$(Build.SourcesDirectory)/infra/exerp-gateway-vm/main.bicep'
+  parametersFile: '$(Build.SourcesDirectory)/infra/exerp-gateway-vm/main.bicepparam'
+  deploymentName: 'exerp-gateway-vm-$(Build.BuildId)'
+
+  # Pull secrets from variable group (library → variable groups in ADO)
+  group: dev-puregym-secrets
+
+# ---------------------------------------------------------------------------
+# Stages
+# ---------------------------------------------------------------------------
+stages:
+
+  # -------------------------------------------------------------------------
+  # STAGE 1: Validate — runs on every PR and every push to main
+  # -------------------------------------------------------------------------
+  - stage: Validate
+    displayName: 'Validate Bicep'
+    jobs:
+      - job: BicepBuild
+        displayName: 'Bicep Build (lint & compile)'
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Install Bicep CLI'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep install
+                az bicep version
+
+          - task: AzureCLI@2
+            displayName: 'az bicep build (lint + compile)'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep build --file $(templateFile) --stdout
+                echo "Bicep compilation: PASSED"
+
+          - task: AzureCLI@2
+            displayName: 'az deployment sub what-if (dry run)'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment sub what-if \
+                  --location $(deploymentLocation) \
+                  --name $(deploymentName)-whatif \
+                  --template-file $(templateFile) \
+                  --parameters $(parametersFile) \
+                  --parameters adminPassword="$(VM_ADMIN_PASSWORD)" \
+                               entraVmAdminGroupObjectId="$(ENTRA_VM_ADMIN_GROUP_OID)" \
+                  --result-format FullResourcePayloads \
+                  --no-prompt
+            env:
+              # Expose secret variable to the script environment
+              VM_ADMIN_PASSWORD: $(VM_ADMIN_PASSWORD)
+              ENTRA_VM_ADMIN_GROUP_OID: $(ENTRA_VM_ADMIN_GROUP_OID)
+
+  # -------------------------------------------------------------------------
+  # STAGE 2: Deploy — runs only on push/merge to main (not on PRs)
+  # -------------------------------------------------------------------------
+  - stage: Deploy
+    displayName: 'Deploy to Production'
+    dependsOn: Validate
+    condition: |
+      and(
+        succeeded('Validate'),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        ne(variables['Build.Reason'], 'PullRequest')
+      )
+    jobs:
+      - deployment: DeployExerpGatewayVM
+        displayName: 'Deploy Exerp Gateway VM (AVM Bicep)'
+        pool:
+          vmImage: 'ubuntu-latest'
+        # Deployment environment enables approvals — configure in ADO:
+        # Pipelines → Environments → exerp-gateway-prod → Approvals & checks
+        environment: 'exerp-gateway-prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Install Bicep CLI'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az bicep install
+
+                - task: AzureCLI@2
+                  displayName: 'az deployment sub create'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az deployment sub create \
+                        --location $(deploymentLocation) \
+                        --name $(deploymentName) \
+                        --template-file $(templateFile) \
+                        --parameters $(parametersFile) \
+                        --parameters adminPassword="$(VM_ADMIN_PASSWORD)" \
+                                     entraVmAdminGroupObjectId="$(ENTRA_VM_ADMIN_GROUP_OID)" \
+                        --no-prompt \
+                        --query "properties.outputs" \
+                        --output json | tee deployment-outputs.json
+
+                      echo "##[section]Deployment outputs:"
+                      cat deployment-outputs.json
+
+                      # Extract and print the static outbound IP for Redshift whitelisting
+                      STATIC_IP=$(cat deployment-outputs.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('vmStaticPublicIp',{}).get('value','NOT FOUND'))")
+                      echo ""
+                      echo "##[warning]⚠️  ACTION REQUIRED: Whitelist this static IP in Amazon Redshift firewall:"
+                      echo "##[warning]   VM Outbound Static IP: $STATIC_IP"
+                      echo "##vso[task.setvariable variable=vmStaticPublicIp;isOutput=true]$STATIC_IP"
+                  env:
+                    VM_ADMIN_PASSWORD: $(VM_ADMIN_PASSWORD)
+                    ENTRA_VM_ADMIN_GROUP_OID: $(ENTRA_VM_ADMIN_GROUP_OID)
+
+                - task: AzureCLI@2
+                  displayName: 'Post-deploy: Verify VM running and Bastion reachable'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      RG="rg-exerp-gateway-prod"
+                      VM="vm-exerp-gateway"
+
+                      echo "Checking VM power state..."
+                      POWER_STATE=$(az vm get-instance-view \
+                        --resource-group $RG \
+                        --name $VM \
+                        --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus" \
+                        --output tsv)
+                      echo "VM power state: $POWER_STATE"
+
+                      if [[ "$POWER_STATE" != "VM running" ]]; then
+                        echo "##[error]VM is not in 'running' state: $POWER_STATE"
+                        exit 1
+                      fi
+
+                      echo "##[section]Post-deploy checklist:"
+                      echo "  [✓] VM deployed and running"
+                      echo "  [ ] Connect via Bastion: Portal → VM → Connect → Bastion → use Entra ID auth"
+                      echo "  [ ] Install Microsoft On-Premises Data Gateway on the VM"
+                      echo "  [ ] Install Amazon Redshift ODBC driver on the VM"
+                      echo "  [ ] Whitelist the static outbound IP in Redshift firewall (see output above)"
