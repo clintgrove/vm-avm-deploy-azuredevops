@@ -1,0 +1,308 @@
+# ==============================================================================
+# Private Endpoint Approval Demo — GitHub Actions Workflow
+# ==============================================================================
+# Purpose:
+#   Demonstrates a two-identity approval pattern using GitHub Actions:
+#
+#   JOB 1 — create-endpoint  (authenticates as sp-pe-creator via OIDC)
+#     • Deploys main.bicep using Identity A's federated credential.
+#     • sp-pe-creator has Network Contributor on the PE resource group ONLY.
+#     • sp-pe-creator has NO role on the storage account → connection = PENDING.
+#
+#   JOB 2 — approve-endpoint  (authenticates as sp-pe-approver via OIDC)
+#     • Runs ONLY after job 1 succeeds.
+#     • Uses a completely different set of OIDC credentials (Identity B).
+#     • sp-pe-approver has the storage-account-scoped approval role → approves.
+#     • sp-pe-approver has NO role on the PE resource group — proving RBAC isolation.
+#
+# ==============================================================================
+# Prerequisites — GitHub repository settings
+#
+# 1. Two Entra ID App Registrations (or Managed Identities) with federated
+#    credentials configured for this repository:
+#
+#    sp-pe-creator
+#      Federated credential subject:  repo:<org>/<repo>:environment:pe-creator
+#      Role on PE resource group   :  Network Contributor
+#      Role on storage account     :  NONE  (intentional — forces Pending state)
+#
+#    sp-pe-approver
+#      Federated credential subject:  repo:<org>/<repo>:environment:pe-approver
+#      Role on storage account     :  Storage Account Contributor
+#                                     — OR — custom role (see LEAST-PRIVILEGE NOTE)
+#      Role on PE resource group   :  NONE  (proving isolation)
+#
+#    How to create a federated credential in the Azure portal:
+#      Entra ID → App Registrations → <app> → Certificates & secrets
+#      → Federated credentials → Add credential → GitHub Actions deploying Azure resources
+#      Set Organisation, Repository, Entity type = Environment, Environment name (see above)
+#
+# 2. Two GitHub Environments configured in:
+#      Repository → Settings → Environments
+#
+#    pe-creator   — no approval gate needed (automated)
+#    pe-approver  — OPTIONALLY add a required reviewer here if you want a human
+#                   gate before the approval job runs
+#
+# 3. GitHub Repository Variables  (Settings → Secrets and variables → Actions → Variables):
+#    AZURE_SUBSCRIPTION_ID          — your Azure subscription ID
+#    AZURE_TENANT_ID                — your Entra ID tenant ID
+#    PE_RESOURCE_GROUP              — resource group to deploy the private endpoint into
+#    STORAGE_ACCOUNT_RESOURCE_ID    — full resource ID of the EXISTING storage account
+#    SUBNET_RESOURCE_ID             — full resource ID of the EXISTING subnet
+#
+# 4. GitHub Repository Secrets  (Settings → Secrets and variables → Actions → Secrets):
+#    CREATOR_CLIENT_ID              — Application (client) ID of sp-pe-creator
+#    APPROVER_CLIENT_ID             — Application (client) ID of sp-pe-approver
+#
+# ==============================================================================
+# LEAST-PRIVILEGE NOTE for sp-pe-approver:
+#
+#   'Storage Account Contributor' grants broad storage management rights and is
+#   fine for this demo. For production, create a custom role with only what the
+#   approve command actually calls:
+#
+#   custom-approver-role.json:
+#   {
+#     "Name": "Private Endpoint Connection Approver",
+#     "IsCustom": true,
+#     "Actions": [
+#       "Microsoft.Storage/storageAccounts/read",
+#       "Microsoft.Storage/storageAccounts/privateEndpointConnections/read",
+#       "Microsoft.Storage/storageAccounts/privateEndpointConnections/write"
+#     ],
+#     "AssignableScopes": ["/subscriptions/<subId>"]
+#   }
+#
+#   Create and assign:
+#     az role definition create --role-definition @custom-approver-role.json
+#     az role assignment create \
+#       --assignee <sp-pe-approver-object-id> \
+#       --role "Private Endpoint Connection Approver" \
+#       --scope <storageAccountResourceId>
+#
+#   This is the minimum permission surface needed. sp-pe-approver literally
+#   cannot touch anything else in Azure with this role.
+# ==============================================================================
+
+name: Private Endpoint — Create and Approve
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'infra/private-endpoint-approval-demo/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'infra/private-endpoint-approval-demo/**'
+  # Allow manual trigger from the GitHub Actions UI for testing.
+  workflow_dispatch:
+
+permissions:
+  # Required for OIDC token issuance — allows both jobs to request federated tokens.
+  id-token: write
+  contents: read
+
+jobs:
+
+  # ============================================================================
+  # JOB 1: create-endpoint
+  # Authenticates as sp-pe-creator.
+  # Deploys main.bicep → private endpoint resource → lands in Pending state.
+  #
+  # RBAC exercised:
+  #   sp-pe-creator → Network Contributor → PE resource group
+  # ============================================================================
+  create-endpoint:
+    name: 'Create Private Endpoint (sp-pe-creator)'
+    runs-on: ubuntu-latest
+    environment: pe-creator   # Federated credential subject must include this environment name.
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Authenticate to Azure as sp-pe-creator using OIDC (no client secret needed).
+      # CREATOR_CLIENT_ID is the Application (client) ID of sp-pe-creator.
+      - name: Azure login — sp-pe-creator
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.CREATOR_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        run: |
+          az bicep install
+          az bicep version
+
+      - name: Bicep lint and compile check
+        run: |
+          az bicep build \
+            --file infra/private-endpoint-approval-demo/main.bicep \
+            --stdout
+          echo "Bicep compilation: PASSED"
+
+      # On pull requests — what-if only, no deployment.
+      - name: What-if dry run (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          az deployment group what-if \
+            --resource-group "${{ vars.PE_RESOURCE_GROUP }}" \
+            --name "pe-approval-demo-whatif-${{ github.run_id }}" \
+            --template-file infra/private-endpoint-approval-demo/main.bicep \
+            --parameters infra/private-endpoint-approval-demo/main.bicepparam \
+            --parameters storageAccountResourceId="${{ vars.STORAGE_ACCOUNT_RESOURCE_ID }}" \
+                         subnetResourceId="${{ vars.SUBNET_RESOURCE_ID }}" \
+            --result-format FullResourcePayloads \
+            --no-prompt
+
+      # On push to main / manual trigger — full deployment.
+      - name: Deploy private endpoint (sp-pe-creator)
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "::notice::Deploying private endpoint as sp-pe-creator..."
+          echo "::notice::Storage account: ${{ vars.STORAGE_ACCOUNT_RESOURCE_ID }}"
+          echo "::notice::Subnet: ${{ vars.SUBNET_RESOURCE_ID }}"
+          echo "::notice::PE resource group: ${{ vars.PE_RESOURCE_GROUP }}"
+
+          az deployment group create \
+            --resource-group "${{ vars.PE_RESOURCE_GROUP }}" \
+            --name "pe-approval-demo-${{ github.run_id }}" \
+            --template-file infra/private-endpoint-approval-demo/main.bicep \
+            --parameters infra/private-endpoint-approval-demo/main.bicepparam \
+            --parameters storageAccountResourceId="${{ vars.STORAGE_ACCOUNT_RESOURCE_ID }}" \
+                         subnetResourceId="${{ vars.SUBNET_RESOURCE_ID }}" \
+            --no-prompt \
+            --query "properties.outputs" \
+            --output json | tee pe-deployment-outputs.json
+
+          echo ""
+          echo "Deployment outputs:"
+          cat pe-deployment-outputs.json
+
+          echo ""
+          echo "::warning::Private endpoint connection is now PENDING on the storage account."
+          echo "::notice::Verify in Azure Portal: Storage account → Networking → Private endpoint connections → Status = Pending"
+          echo "::notice::Job 2 (approve-endpoint) will now run as sp-pe-approver to approve it."
+
+  # ============================================================================
+  # JOB 2: approve-endpoint
+  # Authenticates as sp-pe-approver — a completely different identity.
+  # Queries the pending connection created by job 1 and approves it.
+  # Runs only on push/manual trigger (not PRs) and only after job 1 succeeds.
+  #
+  # RBAC exercised:
+  #   sp-pe-approver → Storage Account Contributor (or custom approver role)
+  #                  → storage account resource ONLY (not the PE resource group)
+  #
+  # ISOLATION PROOF:
+  #   If you swap APPROVER_CLIENT_ID for CREATOR_CLIENT_ID here, the az CLI
+  #   calls will fail with AuthorizationFailed because sp-pe-creator has no
+  #   role on the storage account. That failure confirms the RBAC separation.
+  # ============================================================================
+  approve-endpoint:
+    name: 'Approve Private Endpoint Connection (sp-pe-approver)'
+    runs-on: ubuntu-latest
+    needs: create-endpoint
+    if: github.event_name != 'pull_request'
+    environment: pe-approver   # Federated credential subject must include this environment name.
+                               # Optionally add a required reviewer in GitHub environment settings
+                               # for a human approval gate before this job runs.
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Authenticate to Azure as sp-pe-approver using OIDC.
+      # Note the different secret — APPROVER_CLIENT_ID, not CREATOR_CLIENT_ID.
+      # This is the entire mechanism that switches identity between the two jobs.
+      - name: Azure login — sp-pe-approver
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.APPROVER_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Find and approve pending private endpoint connection
+        run: |
+          set -e
+
+          echo "::notice::Running as sp-pe-approver — resolving storage account details..."
+
+          # Resolve storage account name and resource group from the resource ID.
+          # Requires Microsoft.Storage/storageAccounts/read on the storage account.
+          SA_NAME=$(az storage account show \
+            --ids "${{ vars.STORAGE_ACCOUNT_RESOURCE_ID }}" \
+            --query name -o tsv)
+
+          SA_RG=$(az storage account show \
+            --ids "${{ vars.STORAGE_ACCOUNT_RESOURCE_ID }}" \
+            --query resourceGroup -o tsv)
+
+          echo "Storage account : $SA_NAME"
+          echo "Resource group  : $SA_RG"
+          echo ""
+
+          echo "::notice::Listing all private endpoint connections on the storage account..."
+          # Print the full list for visibility in the workflow log.
+          az storage account private-endpoint-connection list \
+            --account-name "$SA_NAME" \
+            --resource-group "$SA_RG" \
+            --output table
+
+          echo ""
+          echo "::notice::Finding the Pending connection..."
+
+          # Extract the name of the first pending connection.
+          # Requires Microsoft.Storage/storageAccounts/privateEndpointConnections/read.
+          CONN_NAME=$(az storage account private-endpoint-connection list \
+            --account-name "$SA_NAME" \
+            --resource-group "$SA_RG" \
+            --query "[?properties.privateLinkServiceConnectionState.status=='Pending'].name | [0]" \
+            -o tsv)
+
+          if [ -z "$CONN_NAME" ]; then
+            echo "::error::No pending private endpoint connection found on storage account '$SA_NAME'."
+            echo "::error::Possible causes:"
+            echo "::error::  • Job 1 (create-endpoint) failed or did not run."
+            echo "::error::  • The connection was already approved or rejected."
+            echo "::error::  • There are multiple pending connections — review the table above."
+            exit 1
+          fi
+
+          echo "Pending connection: $CONN_NAME"
+          echo ""
+
+          # Approve the connection.
+          # Requires Microsoft.Storage/storageAccounts/privateEndpointConnections/write.
+          echo "::notice::Approving connection '$CONN_NAME' as sp-pe-approver..."
+          az storage account private-endpoint-connection approve \
+            --account-name "$SA_NAME" \
+            --resource-group "$SA_RG" \
+            --name "$CONN_NAME" \
+            --description "Approved by sp-pe-approver | Workflow: ${{ github.workflow }} | Run: ${{ github.run_id }}"
+
+          echo ""
+          echo "::notice::Verifying approval status..."
+
+          # Verify the status changed to Approved.
+          STATUS=$(az storage account private-endpoint-connection show \
+            --account-name "$SA_NAME" \
+            --resource-group "$SA_RG" \
+            --name "$CONN_NAME" \
+            --query "properties.privateLinkServiceConnectionState.status" -o tsv)
+
+          echo "Connection status: $STATUS"
+
+          if [ "$STATUS" != "Approved" ]; then
+            echo "::error::Expected status 'Approved' but got '$STATUS'."
+            exit 1
+          fi
+
+          echo ""
+          echo "::notice::Private endpoint connection successfully approved."
+          echo "::notice::Verify in Azure Portal: Storage account → Networking → Private endpoint connections → Status = Approved"
