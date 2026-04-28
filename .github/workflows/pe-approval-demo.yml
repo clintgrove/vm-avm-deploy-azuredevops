@@ -246,51 +246,31 @@ jobs:
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Upgrade Azure CLI
-        run: |
-          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
-          az version
-
       - name: Find and approve pending private endpoint connection
         run: |
-          set -e
+          set -eo pipefail
 
-          echo "::notice::Running as sp-pe-approver — resolving storage account details..."
+          echo "::notice::Running as sp-pe-approver — listing private endpoint connections..."
 
-          # Resolve storage account name and resource group from the resource ID.
-          # Requires Microsoft.Storage/storageAccounts/read on the storage account.
-          SA_NAME=$(az storage account show \
-            --ids "${{ vars.STORAGE_ACCOUNT_RESOURCE_ID }}" \
-            --query name -o tsv)
-
-          SA_RG=$(az storage account show \
-            --ids "${{ vars.STORAGE_ACCOUNT_RESOURCE_ID }}" \
-            --query resourceGroup -o tsv)
-
-          echo "Storage account : $SA_NAME"
-          echo "Resource group  : $SA_RG"
-          echo ""
-
-          echo "::notice::Listing all private endpoint connections on the storage account..."
-          # Print the full list for visibility in the workflow log.
-          az storage account private-endpoint-connection list \
-            --account-name "$SA_NAME" \
-            --resource-group "$SA_RG" \
+          # az network private-endpoint-connection works on all CLI versions and
+          # operates directly via the parent resource ID (no storage-specific subcommand).
+          # Requires Microsoft.Storage/storageAccounts/privateEndpointConnections/read.
+          echo "::notice::All connections on the storage account:"
+          az network private-endpoint-connection list \
+            --id "${{ vars.STORAGE_ACCOUNT_RESOURCE_ID }}" \
             --output table
 
           echo ""
           echo "::notice::Finding the Pending connection..."
 
-          # Extract the name of the first pending connection.
-          # Requires Microsoft.Storage/storageAccounts/privateEndpointConnections/read.
-          CONN_NAME=$(az storage account private-endpoint-connection list \
-            --account-name "$SA_NAME" \
-            --resource-group "$SA_RG" \
-            --query "[?properties.privateLinkServiceConnectionState.status=='Pending'].name | [0]" \
+          # Extract the resource ID of the first Pending connection.
+          CONN_ID=$(az network private-endpoint-connection list \
+            --id "${{ vars.STORAGE_ACCOUNT_RESOURCE_ID }}" \
+            --query "[?properties.privateLinkServiceConnectionState.status=='Pending'].id | [0]" \
             -o tsv)
 
-          if [ -z "$CONN_NAME" ]; then
-            echo "::error::No pending private endpoint connection found on storage account '$SA_NAME'."
+          if [ -z "$CONN_ID" ]; then
+            echo "::error::No pending private endpoint connection found on the storage account."
             echo "::error::Possible causes:"
             echo "::error::  • Job 1 (create-endpoint) failed or did not run."
             echo "::error::  • The connection was already approved or rejected."
@@ -298,26 +278,22 @@ jobs:
             exit 1
           fi
 
-          echo "Pending connection: $CONN_NAME"
+          echo "Pending connection ID: $CONN_ID"
           echo ""
 
-          # Approve the connection.
+          # Approve the connection by resource ID.
           # Requires Microsoft.Storage/storageAccounts/privateEndpointConnections/write.
-          echo "::notice::Approving connection '$CONN_NAME' as sp-pe-approver..."
-          az storage account private-endpoint-connection approve \
-            --account-name "$SA_NAME" \
-            --resource-group "$SA_RG" \
-            --name "$CONN_NAME" \
+          echo "::notice::Approving connection as sp-pe-approver..."
+          az network private-endpoint-connection approve \
+            --id "$CONN_ID" \
             --description "Approved by sp-pe-approver | Workflow: ${{ github.workflow }} | Run: ${{ github.run_id }}"
 
           echo ""
           echo "::notice::Verifying approval status..."
 
           # Verify the status changed to Approved.
-          STATUS=$(az storage account private-endpoint-connection show \
-            --account-name "$SA_NAME" \
-            --resource-group "$SA_RG" \
-            --name "$CONN_NAME" \
+          STATUS=$(az network private-endpoint-connection show \
+            --id "$CONN_ID" \
             --query "properties.privateLinkServiceConnectionState.status" -o tsv)
 
           echo "Connection status: $STATUS"

@@ -98,7 +98,7 @@ param tags object = {
 // 'Pending' state. Identity B must approve it separately.
 // ---------------------------------------------------------------------------
 
-module privateEndpoint 'br/public:avm/res/network/private-endpoint:0.11.0' = {
+module privateEndpoint 'br/public:avm/res/network/private-endpoint:0.12.0' = {
   name: 'deploy-private-endpoint'
   params: {
     name: privateEndpointName
