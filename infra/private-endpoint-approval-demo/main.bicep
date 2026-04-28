@@ -105,7 +105,11 @@ module privateEndpoint 'br/public:avm/res/network/private-endpoint:0.11.0' = {
     location: location
     tags: tags
     subnetResourceId: subnetResourceId
-    privateLinkServiceConnections: [
+    // manualPrivateLinkServiceConnections (not privateLinkServiceConnections) is required
+    // to land in Pending state. Using the automatic variant requires the deploying identity
+    // to have PrivateEndpointConnectionsApproval/action on the target resource — if it
+    // doesn't, the deployment fails with LinkedAuthorizationFailed rather than going Pending.
+    manualPrivateLinkServiceConnections: [
       {
         name: '${privateEndpointName}-conn'
         properties: {
@@ -113,6 +117,7 @@ module privateEndpoint 'br/public:avm/res/network/private-endpoint:0.11.0' = {
           groupIds: [
             storageSubResource
           ]
+          requestMessage: 'Pending approval — created by sp-pe-creator via GitHub Actions'
         }
       }
     ]

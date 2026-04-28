@@ -164,6 +164,8 @@ jobs:
       - name: Deploy private endpoint (sp-pe-creator)
         if: github.event_name != 'pull_request'
         run: |
+          set -eo pipefail
+
           echo "::notice::Deploying private endpoint as sp-pe-creator..."
           echo "::notice::Storage account: ${{ vars.STORAGE_ACCOUNT_RESOURCE_ID }}"
           echo "::notice::Subnet: ${{ vars.SUBNET_RESOURCE_ID }}"
@@ -183,6 +185,23 @@ jobs:
           echo ""
           echo "Deployment outputs:"
           cat pe-deployment-outputs.json
+
+          # Explicitly verify the deployment reached Succeeded state.
+          # This catches cases where az exited non-zero but the pipe masked it.
+          PROV_STATE=$(az deployment group show \
+            --resource-group "${{ vars.PE_RESOURCE_GROUP }}" \
+            --name "pe-approval-demo-${{ github.run_id }}" \
+            --query "properties.provisioningState" -o tsv)
+
+          echo ""
+          echo "Deployment provisioningState: $PROV_STATE"
+
+          if [ "$PROV_STATE" != "Succeeded" ]; then
+            echo "::error::Deployment failed — provisioningState is '$PROV_STATE'."
+            echo "::error::Run the following to see per-resource errors:"
+            echo "::error::  az deployment operation group list --resource-group ${{ vars.PE_RESOURCE_GROUP }} --name pe-approval-demo-${{ github.run_id }} --query \"[?properties.provisioningState=='Failed']\" --output json"
+            exit 1
+          fi
 
           echo ""
           echo "::warning::Private endpoint connection is now PENDING on the storage account."
@@ -226,7 +245,7 @@ jobs:
           client-id: ${{ secrets.APPROVER_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-          
+
       - name: Upgrade Azure CLI
         run: |
           curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
